@@ -163,9 +163,7 @@ def cmd_acp(args):
         print("conv=%s\nsession=%s\nacp_url=%s" % (conv_id, session_id, acp_url))
         sys.stdout.flush()
 
-        parsed = urlparse(acp_url)
-        connection = http.client.HTTPSConnection(parsed.hostname, 443, timeout=300)
-        headers = {
+        sse_headers = {
             "Authorization": "Bearer " + token,
             "Accept": "text/event-stream",
             "acp-connection-id": conn_id,
@@ -173,31 +171,67 @@ def cmd_acp(args):
             "x-codebuddy-request": "1",
             "Cache-Control": "no-cache",
         }
-        connection.request("GET", parsed.path, headers=headers)
-        response = connection.getresponse()
-        print("sse_status=%s" % response.status)
+        sse_req = urllib.request.Request(acp_url, headers=sse_headers, method="GET")
+        # 用独立连接拿 SSE，避免被 POST 复用后的 socket 池问题
+        import ssl as _ssl
+        parsed = urlparse(acp_url)
+        sse_conn = http.client.HTTPSConnection(parsed.hostname, 443, timeout=300, context=_ssl.create_default_context())
+        sse_conn.request("GET", parsed.path, headers=sse_headers)
+        sse_resp = sse_conn.getresponse()
+        print("sse_status=%s" % sse_resp.status)
         sys.stdout.flush()
 
-        lines = []
+        chunks = []
         done = threading.Event()
 
         def read_sse():
+            """以 event 为单位累积，避免 chunked 编码长度前缀和 heartbeat 混入。"""
+            buffer_lines = []
             try:
+                # 自己迭代原始字节行，urllib 自动解 chunked 但 HTTPSConnection.getresponse 之后
+                # 直接 readline() 读的是解过的字节流（Python http.client 自动处理 chunked）
+                fp = sse_resp
                 while True:
-                    line = response.fp.readline()
-                    if not line:
+                    raw = fp.readline()
+                    if not raw:
                         break
-                    decoded = line.decode("utf-8", errors="replace").strip()
-                    if not decoded:
-                        continue
-                    lines.append(decoded)
-                    if "agent_message" in decoded or "completed" in decoded:
-                        done.set()
-                    if len(lines) > 5000:
-                        break
+                    line = raw.decode("utf-8", errors="replace").rstrip("\r\n")
+                    if line == "":
+                        event_text = "\n".join(buffer_lines)
+                        buffer_lines = []
+                        if not event_text:
+                            continue
+                        if event_text.startswith(":") and "heartbeat" in event_text:
+                            continue
+                        data_line = ""
+                        for ln in event_text.splitlines():
+                            if ln.startswith("data:"):
+                                data_line = ln[len("data:"):].lstrip()
+                                break
+                        if not data_line:
+                            continue
+                        try:
+                            payload = json.loads(data_line)
+                        except ValueError:
+                            continue
+                        lines_out.append(data_line)
+                        params = payload.get("params", {}) or {}
+                        su = params.get("sessionUpdate") or (params.get("update") or {}).get("sessionUpdate", "")
+                        if su == "agent_message_chunk":
+                            content = params.get("content") or {}
+                            if not content:
+                                content = (params.get("update") or {}).get("content") or {}
+                            text = content.get("text", "") if isinstance(content, dict) else ""
+                            if text:
+                                chunks.append(text)
+                        if su in ("agent_message_end", "tool_result_end", "completed"):
+                            done.set()
+                    else:
+                        buffer_lines.append(line)
             except Exception:  # noqa: BLE001
                 pass
 
+        lines_out = []
         threading.Thread(target=read_sse, daemon=True).start()
         time.sleep(2)
 
@@ -225,21 +259,16 @@ def cmd_acp(args):
         while time.time() < deadline and not done.is_set():
             time.sleep(2)
 
-        chunks = []
-        for line in lines:
-            if '"sessionUpdate":"agent_message_chunk"' not in line:
-                continue
-            try:
-                payload = json.loads(line.split("data: ", 1)[1])
-                content = payload.get("params", {}).get("update", {}).get("content", {})
-                if isinstance(content, dict) and content.get("text"):
-                    chunks.append(content["text"])
-            except Exception:  # noqa: BLE001
-                pass
         print("--- FINAL AGENT MESSAGE ---")
         print("MESSAGE:", "".join(chunks)[:2000])
         print("--- END MESSAGE ---")
-        connection.close()
+        print("--- raw events (last 20) ---")
+        for ln in lines_out[-20:]:
+            print(ln[:200])
+        try:
+            sse_resp.close()
+        except Exception:  # noqa: BLE001
+            pass
     return 0
 
 
