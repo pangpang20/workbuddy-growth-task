@@ -1,118 +1,59 @@
-# WorkBuddy Growth Center Task Automation
+---
+name: workbuddy-growth-task
+description: Query and automate WorkBuddy growth center tasks, including progress checks, ACP sessions, telemetry events and reward claiming. Use when the user asks about WorkBuddy growth tasks or task rewards. Do not use for other apps.
+---
 
-本技能用于查询 WorkBuddy 成长中心任务进度、创建 ACP 会话、发送遥测事件、以及尝试完成任务。
+# WorkBuddy 成长中心任务
 
-## 使用场景
+通过 `scripts/growth.py` 操作 WorkBuddy 成长中心：查询任务、接取、领取奖励、发送遥测、发起 ACP 会话。
 
-- 查询成长中心任务列表和进度
-- 创建 ACP 会话并向 agent 发送指令
-- 向 WorkBuddy 后端发送遥测事件（skill_installed / template_used / expert_summoned 等）
-- 尝试领取已完成任务的奖励
+## 前置条件
 
-## 依赖
+- Python 3.8+，WorkBuddy 桌面版已安装并已登录
+- 本机存在 `buddy_station` 模块（提供登录态读取）；通常由 `~/.workbuddy/skills/*/scripts/` 提供
+- `acp` 子命令额外需要 WorkBuddy 客户端正在运行，以及内置的 `workbuddy_ipc`
 
-- Python 3.11（`C:\Users\pangpang\AppData\Local\Programs\Python\Python311\python.exe`）
-- WorkBuddy 桌面版已启动且已登录
-- WorkBuddy 登录凭据文件存在
+路径无需手动配置，`scripts/wb_env.py` 会自动探测。探测失败时用环境变量覆盖：
 
-## 核心脚本
+| 变量 | 含义 |
+|------|------|
+| `WB_BUDDY_STATION_DIR` | `buddy_station.py` 所在目录 |
+| `WB_LIBRARY_DIR` | WorkBuddy 内置 skill library 目录（含 `workbuddy_ipc`） |
+| `WB_CONFIG_DIR` | WorkBuddy 配置根目录，默认 `~/.workbuddy` |
+| `WB_MACHINE_ID` | 发送遥测事件时使用的机器/用户 ID |
+| `WB_OS_VERSION` | 遥测中的 osVersion，默认 `10.0.19045` |
 
-### 1. 查询任务进度
+## 命令
 
-```python
-import sys, os, json
-sys.path.insert(0, r'C:\Users\pangpang\.workbuddy\skills\totorosir-workbuddy-score\scripts')
-import buddy_station as bs
+所有命令在技能目录下执行，形如 `python scripts/growth.py <子命令>`。
 
-p = bs.find_login_state()
-token, domain = bs.load_credentials(p)
-st, body = bs.api_call(domain, token, '/v2/activity/growth/tasks', method='GET')
+```bash
+# 列出未领取的任务与进度
+python scripts/growth.py tasks
+# 包含已领取的任务
+python scripts/growth.py tasks --all
 
-if st == 200 and body.get('code') == 0:
-    for t in body.get('data', {}).get('tasks', []):
-        if t.get('accept_status') != 'claimed':
-            print(t.get('task_code'), t.get('progress', {}))
+# 接取任务
+python scripts/growth.py accept Library_read
+
+# 领取已完成任务的奖励
+python scripts/growth.py claim Library_read
+
+# 探测公众号关注任务接口（只读探测）
+python scripts/growth.py subscribe
+
+# 发送遥测事件；--dry-run 只打印请求体
+python scripts/growth.py events --event skill_installed --id my-skill --dry-run
+
+# 创建 ACP 会话并发送指令，等待 60 秒
+python scripts/growth.py acp "你好，回复 OK" --wait 60
 ```
 
-### 2. 创建 ACP 会话
+`tasks` 每行输出 `task_code`、`accept_status`、`progress`，字段以制表符分隔。
 
-```python
-import sys, json, base64, uuid
-sys.path.insert(0, r'C:\Program Files\WorkBuddy\resources\app.asar.unpacked\resources\plugins\workbuddy-builtin\skills\library')
-import workbuddy_ipc as wb
+## 注意事项
 
-c = wb.connect(client_id='codex-agent', client_kind='skill')
-p = c.get_pipe('wb.request')
-r = p.invoke('http.fetch', {'method': 'POST', 'path': '/v2/as/conversations/', 'body_b64': base64.b64encode(json.dumps({'conversationOrigin': 'agents', 'exclusive': False}).encode()).decode()})
-data = json.loads(base64.b64decode(r['body_b64']))
-conv_id = data['data']['id']
-acp_url = data['data']['session']['link']
-token = data['data']['session']['token']
-```
-
-### 3. 发送遥测事件
-
-```python
-import urllib.request, json, time, uuid
-
-base = {
-    "os": "windows",
-    "osVersion": "10.0.19045",
-    "userAgent": "WorkBuddy/5.9.3 (Electron/37.10.3)",
-    "sessionId": str(uuid.uuid4()),
-    "machineId": "<user_id>",
-    "userId": "<user_id>",
-    "ideName": "WorkBuddy_Desktop",
-    "ideType": "WorkBuddy_Desktop",
-    "pageURL": "workbuddy://profile/growth-center",
-    "timestamp": int(time.time()*1000),
-    "reportDelay": 0,
-}
-
-events = [
-    {**base, "eventCode": "skill_installed", "name": "<skill_name>", "skill_id": "<id>", "skill_version": "1.0.0", "mode": "LOCAL"},
-    {**base, "eventCode": "template_used", "template_id": "<id>", "mode": "LOCAL"},
-    {**base, "eventCode": "expert_summoned", "expert_id": "<id>", "mode": "LOCAL"},
-]
-
-for event in events:
-    body = json.dumps([event]).encode()
-    req = urllib.request.Request("https://www.workbuddy.cn/v2/report", method='POST', data=body)
-    req.add_header('Authorization', 'Bearer <token>')
-    req.add_header('Content-Type', 'application/json')
-    urllib.request.urlopen(req, timeout=15)
-```
-
-### 4. 领取任务奖励
-
-```python
-import sys, json
-sys.path.insert(0, r'C:\Users\pangpang\.workbuddy\skills\totorosir-workbuddy-score\scripts')
-import buddy_station as bs
-
-p = bs.find_login_state()
-token, domain = bs.load_credentials(p)
-
-# Accept task
-st, resp = bs.api_call(domain, token, '/v2/activity/growth/tasks/accept', method='POST', payload={'task_codes': ['Library_read']})
-
-# Claim reward (only if task completed)
-st, resp = bs.api_call(domain, token, '/v2/activity/growth/tasks/Library_read/claim', method='POST', payload={})
-```
-
-## 已知限制
-
-- 服务端通过行为遥测判定任务完成，仅发送 API 事件**不足以**触发进度更新
-- `Library_read` 需要在 WorkBuddy 资料库中阅读文章
-- `Expert_lighthouse` / `WorkBuddy_Valorant` 需要召唤专家并发起对话
-- `wb_wechat_oa_subscribe_task` 需要用户实际关注微信公众号
-- `skill_share` 需要通过分享面板分享技能
-- `skill_1` 需要安装并实际使用技能
-- `template_5` 需要使用 5 个不同模板创建对话
-
-## 推荐完成策略
-
-1. 使用 ACP 会话 + browser-use 技能打开成长中心页面
-2. 但由于 browser-use 无登录态，最终任务完成仍需用户手动操作
-3. 所有已完成的任务可通过 `/v2/activity/growth/tasks/{code}/claim` 领取奖励
-
+- `events` 会向 WorkBuddy 上报接口提交带有 machineId / userAgent 的事件。伪造行为遥测以完成任务可能违反平台条款，可能带来账号风险，只在明确知情时使用，并优先使用 `--dry-run` 校验。
+- 服务端以行为遥测判定任务完成，仅发送 API 事件通常**不足以**推进进度。
+- 需要真实操作才能完成的任务：`Library_read`（阅读资料库文章）、`Expert_lighthouse` / `WorkBuddy_Valorant`（召唤专家对话）、`wb_wechat_oa_subscribe_task`（关注公众号）、`skill_share`（分享面板）、`skill_1`（安装并使用技能）、`template_5`（使用 5 个模板建对话）。
+- 已完成的任务可通过 `claim` 领取奖励；未完成时接口会返回错误码。
